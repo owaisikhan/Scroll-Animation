@@ -10,7 +10,7 @@ import {
   Lightbulb,
   Manifesto,
   Team,
-  Transition,
+  Spacer,
 } from "@/components/Sections";
 
 export default function Home() {
@@ -25,8 +25,10 @@ export default function Home() {
         <Intro />
         <Manifesto />
         <Lightbulb />
-        <Transition />
+        <Spacer id="bulbHold" />
+        <Spacer id="transition" />
         <Globe />
+        <Spacer id="globeHold" />
         <Team />
         <Footer />
       </main>

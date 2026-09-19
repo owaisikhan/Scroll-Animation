@@ -151,12 +151,12 @@ export function Lightbulb() {
 }
 
 /**
- * Empty screen between the bulb and the globe. The cloud needs real scroll
- * distance to come apart and rebuild; without it the globe would only exist
- * for a single frame at the end of the leg.
+ * Empty screen used two ways: to hold an assembled form on screen for a beat,
+ * and to give the cloud real scroll distance to come apart and rebuild.
+ * Without these the forms would exist for a single frame at the end of a leg.
  */
-export function Transition() {
-  return <section id="transition" aria-hidden="true" className="h-svh w-full" />;
+export function Spacer({ id }: { id: string }) {
+  return <section id={id} aria-hidden="true" className="h-svh w-full" />;
 }
 
 export function Globe() {

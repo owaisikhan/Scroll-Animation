@@ -1,19 +1,21 @@
 /**
  * Shape sources for the particle cloud.
  *
- * Each shape is drawn as original 2D artwork on an offscreen canvas, then
- * turned into a 3D point cloud:
- *   - a sharp render gives the silhouette we rejection-sample XY from
- *   - a blurred render gives a thickness field, so points sit deeper in the
- *     middle of a form than at its edge and the cloud reads as a solid when
- *     it rotates, rather than as a flat cutout.
+ * Each form is a hollow 3D shell, not a filled silhouette: points are sampled
+ * on the surfaces of a few parametric primitives, so the far side of the form
+ * shows through the near side and the rim reads dense at grazing angles.
+ * Shapes are assembled from ellipsoids, cones and capsules and then displaced
+ * by value noise, which is what gives the brain its folds.
  */
 
 export type ShapeName = "brain" | "bulb" | "globe";
 
-const RES = 512;
+export interface ShapeCloud {
+  positions: Float32Array;
+}
 
-/** Deterministic RNG so a reload produces the same cloud. */
+/* ---------- deterministic randomness ---------- */
+
 function mulberry32(seed: number) {
   let a = seed >>> 0;
   return () => {
@@ -24,263 +26,197 @@ function mulberry32(seed: number) {
   };
 }
 
-type Ctx = CanvasRenderingContext2D;
+type Rand = () => number;
 
-/** Draw in a 1000x1000 design space regardless of canvas resolution. */
-function withDesignSpace(ctx: Ctx, draw: (c: Ctx) => void) {
-  ctx.save();
-  ctx.scale(RES / 1000, RES / 1000);
-  ctx.fillStyle = "#fff";
-  ctx.strokeStyle = "#fff";
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  draw(ctx);
-  ctx.restore();
+/** Box-Muller, for evenly covering a sphere via normalised gaussians. */
+function gauss(rand: Rand) {
+  const u = Math.max(1e-9, rand());
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand());
 }
 
-function drawBrain(ctx: Ctx) {
-  withDesignSpace(ctx, (c) => {
-    // Cerebrum
-    c.beginPath();
-    c.moveTo(180, 520);
-    c.bezierCurveTo(110, 430, 120, 320, 205, 258);
-    c.bezierCurveTo(285, 185, 395, 158, 505, 172);
-    c.bezierCurveTo(630, 158, 740, 188, 802, 252);
-    c.bezierCurveTo(858, 305, 872, 372, 858, 432);
-    c.bezierCurveTo(862, 492, 840, 534, 792, 560);
-    c.bezierCurveTo(742, 592, 686, 602, 622, 598);
-    c.bezierCurveTo(520, 612, 428, 606, 332, 590);
-    c.bezierCurveTo(258, 592, 208, 566, 180, 520);
-    c.closePath();
-    c.fill();
+/* ---------- value noise, for surface displacement ---------- */
 
-    // Cerebellum
-    c.beginPath();
-    c.ellipse(712, 628, 104, 74, -0.18, 0, Math.PI * 2);
-    c.fill();
-
-    // Brain stem
-    c.beginPath();
-    c.moveTo(596, 588);
-    c.bezierCurveTo(614, 680, 620, 770, 606, 862);
-    c.lineTo(668, 862);
-    c.bezierCurveTo(686, 764, 684, 674, 668, 586);
-    c.closePath();
-    c.fill();
-
-    // Gyri — interior folds give the cloud its density variation
-    c.lineWidth = 15;
-    const folds: [number, number][][] = [
-      [[240, 470], [300, 400], [250, 340], [330, 292]],
-      [[360, 560], [400, 470], [340, 424], [418, 352]],
-      [[470, 572], [520, 486], [452, 430], [540, 366]],
-      [[590, 560], [640, 472], [566, 420], [654, 352]],
-      [[700, 528], [752, 452], [688, 400], [762, 330]],
-      [[300, 250], [390, 286], [470, 242], [556, 280]],
-      [[600, 252], [676, 292], [744, 262], [800, 312]],
-    ];
-    for (const pts of folds) {
-      c.beginPath();
-      c.moveTo(pts[0][0], pts[0][1]);
-      for (let i = 1; i < pts.length - 1; i++) {
-        const mx = (pts[i][0] + pts[i + 1][0]) / 2;
-        const my = (pts[i][1] + pts[i + 1][1]) / 2;
-        c.quadraticCurveTo(pts[i][0], pts[i][1], mx, my);
-      }
-      c.stroke();
-    }
-  });
+function hash3(x: number, y: number, z: number) {
+  const s = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453;
+  return s - Math.floor(s);
 }
 
-function drawBulb(ctx: Ctx) {
-  withDesignSpace(ctx, (c) => {
-    // Glass envelope: a circle swept from lower-left, over the top, to
-    // lower-right, then drawn in to a waisted neck.
-    const cx = 500;
-    const cy = 372;
-    const r = 214;
-    c.beginPath();
-    c.arc(cx, cy, r, Math.PI * 0.76, Math.PI * 0.24, false);
-    // right shoulder -> neck
-    c.bezierCurveTo(636, 566, 592, 596, 578, 648);
-    c.lineTo(572, 684);
-    c.lineTo(428, 684);
-    c.lineTo(422, 648);
-    // neck -> left shoulder
-    c.bezierCurveTo(408, 596, 364, 566, 348, 530);
-    c.closePath();
-    c.fill();
-
-    // Screw base: a slight taper with three thread steps, then a rounded tip.
-    const threads: [number, number, number][] = [
-      [696, 434, 566],
-      [740, 430, 562],
-      [784, 426, 558],
-    ];
-    for (const [y, x0, x1] of threads) {
-      c.beginPath();
-      c.moveTo(x0, y);
-      c.lineTo(x1, y);
-      c.lineTo(x1 - 4, y + 34);
-      c.lineTo(x0 + 4, y + 34);
-      c.closePath();
-      c.fill();
-    }
-    c.beginPath();
-    c.moveTo(430, 826);
-    c.lineTo(570, 826);
-    c.bezierCurveTo(566, 878, 540, 902, 500, 904);
-    c.bezierCurveTo(460, 902, 434, 878, 430, 826);
-    c.closePath();
-    c.fill();
-
-    // Filament — the detail that makes it unmistakably a bulb.
-    c.lineWidth = 15;
-    c.beginPath();
-    c.moveTo(444, 620);
-    c.lineTo(452, 452);
-    c.quadraticCurveTo(476, 366, 500, 444);
-    c.quadraticCurveTo(524, 366, 548, 452);
-    c.lineTo(556, 620);
-    c.stroke();
-  });
+function noise3(x: number, y: number, z: number) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const xf = x - xi, yf = y - yi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf);
+  const v = yf * yf * (3 - 2 * yf);
+  const w = zf * zf * (3 - 2 * zf);
+  const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+  const c = (i: number, j: number, k: number) => hash3(xi + i, yi + j, zi + k);
+  return lerp(
+    lerp(lerp(c(0, 0, 0), c(1, 0, 0), u), lerp(c(0, 1, 0), c(1, 1, 0), u), v),
+    lerp(lerp(c(0, 0, 1), c(1, 0, 1), u), lerp(c(0, 1, 1), c(1, 1, 1), u), v),
+    w,
+  );
 }
 
-function drawGlobe(ctx: Ctx) {
-  withDesignSpace(ctx, (c) => {
-    c.beginPath();
-    c.arc(500, 500, 330, 0, Math.PI * 2);
-    c.fill();
+/* ---------- primitives, each emitting points on its surface ---------- */
 
-    // Everything below is carved out of the disc as thin contours. Filled
-    // cut-outs would hollow the sphere and it would read as a ring.
-    c.globalCompositeOperation = "destination-out";
+type Vec3 = [number, number, number];
+type Emit = (x: number, y: number, z: number) => void;
 
-    // Two meridians and one equator — any more and the rings alias into a
-    // moire once the sphere is sampled as points.
-    c.lineWidth = 9;
-    for (const rx of [112, 236]) {
-      c.beginPath();
-      c.ellipse(500, 500, rx, 330, 0, 0, Math.PI * 2);
-      c.stroke();
-    }
-    c.beginPath();
-    c.ellipse(500, 500, 330, 120, 0, 0, Math.PI * 2);
-    c.stroke();
-
-    // Stylised coastlines, stroked so the land stays part of the sphere.
-    c.lineWidth = 13;
-    const coast = (pts: [number, number][]) => {
-      c.beginPath();
-      c.moveTo(pts[0][0], pts[0][1]);
-      for (let i = 1; i <= pts.length; i++) {
-        const p = pts[i % pts.length];
-        const n = pts[(i + 1) % pts.length];
-        c.quadraticCurveTo(p[0], p[1], (p[0] + n[0]) / 2, (p[1] + n[1]) / 2);
-      }
-      c.closePath();
-      c.stroke();
-    };
-    coast([[486, 286], [586, 316], [612, 396], [586, 466], [622, 540], [584, 648], [516, 720], [458, 644], [430, 532], [404, 424], [424, 330]]);
-    coast([[292, 386], [360, 352], [398, 410], [350, 464], [296, 446]]);
-    coast([[676, 600], [736, 592], [758, 646], [712, 686], [668, 654]]);
-
-    c.globalCompositeOperation = "source-over";
-  });
+/** Surface of an axis-aligned ellipsoid. */
+function ellipsoidSurface(rand: Rand, n: number, c: Vec3, r: Vec3, emit: Emit) {
+  for (let i = 0; i < n; i++) {
+    let x = gauss(rand), y = gauss(rand), z = gauss(rand);
+    const len = Math.hypot(x, y, z) || 1;
+    x /= len; y /= len; z /= len;
+    emit(c[0] + x * r[0], c[1] + y * r[1], c[2] + z * r[2]);
+  }
 }
 
-const DRAWERS: Record<ShapeName, (c: Ctx) => void> = {
-  brain: drawBrain,
-  bulb: drawBulb,
-  globe: drawGlobe,
-};
-
-function render(name: ShapeName, blurPx: number): Uint8ClampedArray {
-  const canvas = document.createElement("canvas");
-  canvas.width = canvas.height = RES;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
-  ctx.clearRect(0, 0, RES, RES);
-  if (blurPx > 0) ctx.filter = `blur(${blurPx}px)`;
-  DRAWERS[name](ctx);
-  ctx.filter = "none";
-  return ctx.getImageData(0, 0, RES, RES).data;
+/** Lateral surface of a cone frustum aligned to Y. */
+function frustumSurface(
+  rand: Rand, n: number, c: Vec3, y0: number, y1: number, r0: number, r1: number, emit: Emit,
+) {
+  for (let i = 0; i < n; i++) {
+    const t = rand();
+    const y = y0 + (y1 - y0) * t;
+    const r = r0 + (r1 - r0) * t;
+    const a = rand() * Math.PI * 2;
+    emit(c[0] + Math.cos(a) * r, c[1] + y, c[2] + Math.sin(a) * r);
+  }
 }
 
-export interface ShapeCloud {
-  /** xyz triplets, centred on the origin, roughly within a unit-ish box. */
-  positions: Float32Array;
+/** Flat annulus/disc in the XZ plane. */
+function discSurface(rand: Rand, n: number, c: Vec3, y: number, rInner: number, rOuter: number, emit: Emit) {
+  for (let i = 0; i < n; i++) {
+    const r = Math.sqrt(rInner * rInner + rand() * (rOuter * rOuter - rInner * rInner));
+    const a = rand() * Math.PI * 2;
+    emit(c[0] + Math.cos(a) * r, c[1] + y, c[2] + Math.sin(a) * r);
+  }
 }
 
-/**
- * Sample `count` points from a shape. Points are drawn from the silhouette
- * with probability proportional to coverage, then pushed off the drawing
- * plane by the local thickness so the form has depth.
- */
-export function buildShape(name: ShapeName, count: number, seed = 1): ShapeCloud {
-  const sharp = render(name, 0);
-  const soft = render(name, 26);
+/* ---------- the three forms ---------- */
 
-  // Build a CDF over covered pixels so sampling is uniform across the form.
-  const weights: number[] = [];
-  const index: number[] = [];
-  let total = 0;
-  for (let i = 0; i < RES * RES; i++) {
-    const a = sharp[i * 4 + 3];
-    if (a > 8) {
-      total += a;
-      weights.push(total);
-      index.push(i);
-    }
+function buildBrain(rand: Rand, count: number, emit: Emit) {
+  // Two cerebral lobes, split by a longitudinal fissure, plus cerebellum and
+  // stem. Gyri come from ridged noise displacement along the surface normal.
+  const lobe = Math.floor(count * 0.40);
+  const cere = Math.floor(count * 0.09);
+  const stem = Math.floor(count * 0.05);
+
+  const foldy = (x: number, y: number, z: number, amp: number): Vec3 => {
+    const n1 = noise3(x * 3.1, y * 3.1, z * 3.1);
+    const n2 = noise3(x * 7.3 + 11, y * 7.3, z * 7.3);
+    // Ridged noise creates creases rather than lumps.
+    const ridge = 1 - Math.abs(n1 * 2 - 1);
+    const d = (ridge * 0.7 + n2 * 0.3 - 0.45) * amp;
+    const len = Math.hypot(x, y, z) || 1;
+    return [x + (x / len) * d, y + (y / len) * d, z + (z / len) * d];
+  };
+
+  for (const side of [-1, 1]) {
+    ellipsoidSurface(rand, lobe, [0, 0, 0], [1.02, 0.78, 0.86], (x, y, z) => {
+      // Push each lobe off the midline and squash the inner face flat.
+      let zz = z;
+      if (Math.sign(zz) !== side) zz = -zz;
+      zz = side * (Math.abs(zz) * 0.62 + 0.1);
+      const [fx, fy, fz] = foldy(x, y, zz, 0.12);
+      emit(fx, fy - 0.02, fz);
+    });
   }
 
+  ellipsoidSurface(rand, cere, [0.54, -0.52, 0], [0.34, 0.24, 0.30], (x, y, z) => {
+    const [fx, fy, fz] = foldy(x * 1.4, y * 1.4, z * 1.4, 0.09);
+    emit(fx * 0.72 + 0.54 * 0.28, fy * 0.72 - 0.52 * 0.28, fz * 0.72);
+  });
+
+  frustumSurface(rand, stem, [0.30, 0, 0], -1.32, -0.42, 0.085, 0.17, emit);
+}
+
+function buildBulb(rand: Rand, count: number, emit: Emit) {
+  const glass = Math.floor(count * 0.60);
+  const neck = Math.floor(count * 0.10);
+  const thread = Math.floor(count * 0.22);
+
+  // Envelope: a sphere pinched into the neck over its lower third.
+  ellipsoidSurface(rand, glass, [0, 0.28, 0], [0.74, 0.78, 0.74], (x, y, z) => {
+    if (y < 0.05) {
+      // Taper the bottom of the sphere inward to meet the neck.
+      const t = Math.min(1, (0.05 - y) / 0.62);
+      const k = 1 - t * 0.66;
+      emit(x * k, y, z * k);
+    } else {
+      emit(x, y, z);
+    }
+  });
+
+  frustumSurface(rand, neck, [0, 0, 0], -0.62, -0.40, 0.26, 0.30, emit);
+
+  // Screw base: three stepped rings read as threads once sampled.
+  for (let i = 0; i < 3; i++) {
+    const y0 = -0.66 - i * 0.16;
+    frustumSurface(rand, Math.floor(thread / 3), [0, 0, 0], y0 - 0.14, y0, 0.235 - i * 0.012, 0.265 - i * 0.012, emit);
+  }
+  ellipsoidSurface(rand, Math.floor(count * 0.05), [0, -1.14, 0], [0.20, 0.13, 0.20], (x, y, z) => {
+    if (y <= 0.01) emit(x, y, z);
+  });
+  discSurface(rand, Math.floor(count * 0.03), [0, 0, 0], -1.14, 0, 0.20, emit);
+}
+
+function buildGlobe(rand: Rand, count: number, emit: Emit) {
+  ellipsoidSurface(rand, count, [0, 0, 0], [1, 1, 1], (x, y, z) => {
+    // Faint relief so the sphere is not perfectly smooth.
+    const d = (noise3(x * 2.6 + 5, y * 2.6, z * 2.6) - 0.5) * 0.05;
+    emit(x * (1 + d), y * (1 + d), z * (1 + d));
+  });
+}
+
+/* ---------- public API ---------- */
+
+const BUILDERS: Record<ShapeName, (r: Rand, n: number, e: Emit) => void> = {
+  brain: buildBrain,
+  bulb: buildBulb,
+  globe: buildGlobe,
+};
+
+/** World-space size of each form, so they read at comparable scale. */
+const SCALE: Record<ShapeName, number> = { brain: 1.58, bulb: 1.54, globe: 1.42 };
+
+export function buildShape(name: ShapeName, count: number, seed = 1): ShapeCloud {
   const rand = mulberry32(seed);
   const positions = new Float32Array(count * 3);
-  const scale = 2.6; // design-space -> world units
+  const s = SCALE[name];
+  let w = 0;
 
-  for (let p = 0; p < count; p++) {
-    // Binary search the CDF
-    const target = rand() * total;
-    let lo = 0;
-    let hi = weights.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (weights[mid] < target) lo = mid + 1;
-      else hi = mid;
-    }
-    const pix = index[lo];
-    const px = (pix % RES) + rand();
-    const py = Math.floor(pix / RES) + rand();
+  BUILDERS[name](rand, count, (x, y, z) => {
+    if (w >= count) return;
+    positions[w * 3] = x * s;
+    positions[w * 3 + 1] = y * s;
+    positions[w * 3 + 2] = z * s;
+    w++;
+  });
 
-    // Thickness from the blurred field, shaped so the depth profile is domed
-    // rather than boxy.
-    const t = soft[pix * 4 + 3] / 255;
-    const thickness = Math.sqrt(Math.max(0, t)) * 0.42;
-
-    // Cosine-weighted depth keeps the surface denser than the core, which is
-    // what makes the silhouette stay crisp while the form still rotates.
-    const u = rand() * 2 - 1;
-    const z = Math.sign(u) * Math.pow(Math.abs(u), 0.65) * thickness;
-
-    positions[p * 3 + 0] = (px / RES - 0.5) * scale;
-    positions[p * 3 + 1] = -(py / RES - 0.5) * scale;
-    positions[p * 3 + 2] = z * scale;
+  // Primitives emit by proportion and can land just short; scatter any
+  // remainder loosely around the form as the strays seen drifting outside it.
+  for (; w < count; w++) {
+    positions[w * 3] = (rand() * 2 - 1) * s * 2.2;
+    positions[w * 3 + 1] = (rand() * 2 - 1) * s * 1.5;
+    positions[w * 3 + 2] = (rand() * 2 - 1) * s * 1.2;
   }
 
   return { positions };
 }
 
-/** A loose spherical cloud used for the dispersed state between shapes. */
+/** A loose cloud used for the dispersed state between forms. */
 export function buildScatter(count: number, seed = 7, radius = 2.6): Float32Array {
   const rand = mulberry32(seed);
   const out = new Float32Array(count * 3);
   for (let i = 0; i < count; i++) {
     const u = rand() * 2 - 1;
     const theta = rand() * Math.PI * 2;
-    const r = radius * (0.35 + 0.65 * Math.cbrt(rand()));
+    const r = radius * (0.30 + 0.70 * Math.cbrt(rand()));
     const s = Math.sqrt(1 - u * u);
-    out[i * 3 + 0] = r * s * Math.cos(theta) * 1.5;
-    out[i * 3 + 1] = r * s * Math.sin(theta);
-    out[i * 3 + 2] = r * u * 0.6;
+    out[i * 3] = r * s * Math.cos(theta) * 1.7;
+    out[i * 3 + 1] = r * s * Math.sin(theta) * 1.1;
+    out[i * 3 + 2] = r * u * 0.8;
   }
   return out;
 }

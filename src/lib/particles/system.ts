@@ -4,14 +4,13 @@ import { fragmentShader, vertexShader } from "./shaders";
 
 /** Weighted palette — mostly white, with the accent hues sprinkled through. */
 const PALETTE: [string, number][] = [
-  ["#ffffff", 58],
-  ["#d8d8de", 14],
-  ["#f6b93b", 9],
-  ["#ffd98a", 4],
-  ["#8b5cf6", 6],
-  ["#c4b5fd", 3],
-  ["#2dd4bf", 3],
-  ["#f472b6", 3],
+  ["#ffffff", 40],
+  ["#dcdce4", 18],
+  ["#f6b93b", 12],
+  ["#8b5cf6", 11],
+  ["#c4b5fd", 5],
+  ["#2dd4bf", 7],
+  ["#f472b6", 7],
 ];
 
 function pickColor(r: number): THREE.Color {
@@ -85,7 +84,7 @@ export class ParticleSystem {
     const coarse =
       typeof window !== "undefined" &&
       window.matchMedia("(pointer: coarse)").matches;
-    this.count = count ?? (coarse ? 16000 : 52000);
+    this.count = count ?? (coarse ? 8000 : 18000);
 
     this.renderer = new THREE.WebGLRenderer({
       canvas,
@@ -123,7 +122,7 @@ export class ParticleSystem {
     for (let i = 0; i < n; i++) {
       seeds[i] = rand();
       // Long tail on size: many specks, a few large outlined triangles.
-      scales[i] = 0.26 + Math.pow(rand(), 3.8) * 2.6;
+      scales[i] = 0.18 + Math.pow(rand(), 6.5) * 8.4;
       spins[i] = rand() * Math.PI * 2;
       const c = pickColor(rand());
       colors[i * 3] = c.r;
@@ -155,12 +154,16 @@ export class ParticleSystem {
         uMorph: { value: 0 },
         uSpread: { value: 0 },
         uTime: { value: 0 },
-        uSize: { value: 1.1 },
+        uSize: { value: 1.0 },
         uPixelRatio: { value: 1 },
         uPointer: { value: new THREE.Vector3(999, 999, 0) },
         uPointerOn: { value: 0 },
         uBreath: { value: 1 },
         uOpacity: { value: 1 },
+        uRimColor: { value: new THREE.Color("#f6b93b") },
+        uRadius: { value: 2.6 },
+        uFocus: { value: 7.4 },
+        uDofRange: { value: 9.0 },
       },
     });
 
@@ -198,7 +201,7 @@ export class ParticleSystem {
     this.camera.position.z = w / h < 0.9 ? 10.5 : 7.4;
     this.camera.updateProjectionMatrix();
     this.material.uniforms.uPixelRatio.value = dpr;
-    this.material.uniforms.uSize.value = Math.min(w, 1600) / 1400 + 0.42;
+    this.material.uniforms.uSize.value = Math.min(w, 1600) / 1500 + 0.38;
   };
 
   start() {
@@ -254,6 +257,8 @@ export class ParticleSystem {
     const dist = (this.group.position.z - this.camera.position.z) / ray.z;
     const world = this.camera.position.clone().add(ray.multiplyScalar(dist));
     u.uPointer.value.copy(this.group.worldToLocal(world));
+
+    u.uFocus.value = this.camera.position.z - this.group.position.z;
 
     this.renderer.render(this.scene, this.camera);
   }

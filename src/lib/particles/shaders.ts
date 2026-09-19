@@ -8,21 +8,25 @@ attribute float aScale;
 attribute vec3  aColor;
 attribute float aSpin;
 
-uniform float uMorph;        // 0..1 between aFrom and aTo
-uniform float uSpread;       // global dispersal amount
+uniform float uMorph;
+uniform float uSpread;
 uniform float uTime;
 uniform float uSize;
 uniform float uPixelRatio;
-uniform vec3  uPointer;      // pointer in local space
-uniform float uPointerOn;    // 0..1 strength gate
-uniform float uBreath;       // idle drift amount
+uniform vec3  uPointer;
+uniform float uPointerOn;
+uniform float uBreath;
+uniform vec3  uRimColor;
+uniform float uRadius;
+uniform float uFocus;      // view-space distance held in focus
+uniform float uDofRange;
 
 varying vec3  vColor;
-varying float vSeed;
-varying float vSpin;
+varying float vBlur;
 varying float vFade;
+varying vec4  vA;          // projected tetra verts 0,1
+varying vec4  vB;          // projected tetra verts 2,3
 
-// Cheap value-noise gradient, enough for organic drift without a texture.
 vec3 hash3(vec3 p) {
   p = vec3(dot(p, vec3(127.1, 311.7, 74.7)),
            dot(p, vec3(269.5, 183.3, 246.1)),
@@ -30,50 +34,68 @@ vec3 hash3(vec3 p) {
   return fract(sin(p) * 43758.5453123) * 2.0 - 1.0;
 }
 
+mat3 rotY(float a) {
+  float s = sin(a), c = cos(a);
+  return mat3(c, 0.0, -s, 0.0, 1.0, 0.0, s, 0.0, c);
+}
+mat3 rotX(float a) {
+  float s = sin(a), c = cos(a);
+  return mat3(1.0, 0.0, 0.0, 0.0, c, s, 0.0, -s, c);
+}
+
 void main() {
-  // Per-particle stagger: each point starts its morph at a slightly different
-  // time, so the cloud flows between forms instead of snapping as one block.
+  // Per-particle stagger so the cloud flows between forms.
   float stagger = 0.42;
-  float offset  = aSeed * stagger;
-  float local   = clamp((uMorph - offset) / (1.0 - stagger), 0.0, 1.0);
-  float eased   = local * local * (3.0 - 2.0 * local);
+  float local = clamp((uMorph - aSeed * stagger) / (1.0 - stagger), 0.0, 1.0);
+  float eased = local * local * (3.0 - 2.0 * local);
 
   vec3 pos = mix(aFrom, aTo, eased);
 
-  // Mid-morph bulge — points swing wide of the straight line between forms.
   float arc = sin(eased * 3.14159265);
   vec3 drift = hash3(aFrom * 1.7 + aSeed * 13.0);
   pos += drift * arc * 0.9;
 
-  // Idle breathing so the form is never completely static.
   vec3 wob = hash3(aFrom * 3.1 + 7.0);
-  pos += wob * sin(uTime * 0.6 + aSeed * 6.2831) * 0.035 * uBreath;
+  pos += wob * sin(uTime * 0.55 + aSeed * 6.2831) * 0.03 * uBreath;
 
-  // Scroll-driven dispersal: the whole cloud loosens and inflates.
   pos += drift * uSpread * 2.4;
   pos *= 1.0 + uSpread * 0.55;
 
-  // Pointer lens: inside a small radius points push apart and grow, while the
-  // silhouette as a whole stays put.
+  // Pointer lens: nearby tetrahedra glide outward and swell.
   float lens = 0.0;
   if (uPointerOn > 0.001) {
-    vec3 delta = pos - uPointer;
-    float d = length(delta.xy);
-    lens = exp(-d * d / 0.75) * uPointerOn;
-    pos += normalize(vec3(delta.xy, 0.001)) * lens * 0.52;
+    vec3 d = pos - uPointer;
+    float r = length(d.xy);
+    lens = exp(-r * r / 0.85) * uPointerOn;
+    // Enough to part the cloud and let it glide, not enough to hollow it.
+    pos += normalize(vec3(d.xy, 0.001)) * lens * 0.24;
   }
 
   vec4 mv = modelViewMatrix * vec4(pos, 1.0);
   gl_Position = projectionMatrix * mv;
 
-  // Points thin out as they disperse, and swell under the pointer.
-  float size = uSize * aScale * (1.0 + lens * 1.9) * (1.0 + uSpread * 0.35);
+  // Rim: outer shell runs warm, the interior stays near-white.
+  float rim = smoothstep(0.60, 1.12, length(pos.xy) / uRadius);
+  vColor = mix(aColor, uRimColor, rim * 0.5);
+
+  // Depth of field — distance from the focal plane softens the wireframe.
+  vBlur = clamp(abs(-mv.z - uFocus) / uDofRange, 0.0, 1.0);
+
+  float size = uSize * aScale * (1.0 + lens * 2.2) * (1.0 + uSpread * 0.30);
   gl_PointSize = size * uPixelRatio * (12.0 / max(0.001, -mv.z));
 
-  vColor = aColor;
-  vSeed  = aSeed;
-  vSpin  = aSpin + uTime * (0.08 + aSeed * 0.12) + lens * 2.0;
-  vFade  = 1.0 - uSpread * 0.35;
+  vFade = (1.0 - uSpread * 0.22) * (1.0 - vBlur * 0.22);
+
+  // Project a unit tetrahedron under this particle's own rotation. The four
+  // screen-space vertices are handed to the fragment stage, which strokes the
+  // six edges between them.
+  mat3 rot = rotY(aSpin + uTime * (0.10 + aSeed * 0.16)) * rotX(aSpin * 1.7 + uTime * 0.07);
+  vec3 t0 = rot * vec3( 0.5773,  0.5773,  0.5773);
+  vec3 t1 = rot * vec3( 0.5773, -0.5773, -0.5773);
+  vec3 t2 = rot * vec3(-0.5773,  0.5773, -0.5773);
+  vec3 t3 = rot * vec3(-0.5773, -0.5773,  0.5773);
+  vA = vec4(t0.xy, t1.xy);
+  vB = vec4(t2.xy, t3.xy);
 }
 `;
 
@@ -81,40 +103,41 @@ export const fragmentShader = /* glsl */ `
 precision highp float;
 
 varying vec3  vColor;
-varying float vSeed;
-varying float vSpin;
+varying float vBlur;
 varying float vFade;
+varying vec4  vA;
+varying vec4  vB;
 
 uniform float uOpacity;
 
-// Signed distance to an equilateral triangle centred on the origin.
-float sdTriangle(vec2 p) {
-  const float k = 1.7320508;
-  p.x = abs(p.x) - 1.0;
-  p.y = p.y + 1.0 / k;
-  if (p.x + k * p.y > 0.0) p = vec2(p.x - k * p.y, -k * p.x - p.y) / 2.0;
-  p.x -= clamp(p.x, -2.0, 0.0);
-  return -length(p) * sign(p.y);
+float segDist(vec2 p, vec2 a, vec2 b) {
+  vec2 pa = p - a;
+  vec2 ba = b - a;
+  float h = clamp(dot(pa, ba) / max(1e-5, dot(ba, ba)), 0.0, 1.0);
+  return length(pa - ba * h);
 }
 
 void main() {
   vec2 p = (gl_PointCoord - 0.5) * 2.0;
+  p.y = -p.y;
 
-  float s = sin(vSpin);
-  float c = cos(vSpin);
-  p = mat2(c, -s, s, c) * p;
+  vec2 a = vA.xy, b = vA.zw, c = vB.xy, d = vB.zw;
 
-  float d = sdTriangle(p / 0.92);
-  float aa = fwidth(d) * 1.1;
+  // Six edges of the tetrahedron.
+  float dist = segDist(p, a, b);
+  dist = min(dist, segDist(p, a, c));
+  dist = min(dist, segDist(p, a, d));
+  dist = min(dist, segDist(p, b, c));
+  dist = min(dist, segDist(p, b, d));
+  dist = min(dist, segDist(p, c, d));
 
-  // Most points are hairline outlines; a minority are solid. That mix is what
-  // gives the cloud its glitter at small sizes.
-  float filled = step(0.78, vSeed);
-  float stroke = 1.0 - smoothstep(0.0, aa, abs(d) - 0.16);
-  float solid  = 1.0 - smoothstep(0.0, aa, d);
-  float mask   = mix(stroke, solid, filled);
+  // Hairline stroke, widened and softened by the depth-of-field term.
+  float aa = fwidth(dist) + 0.012;
+  float width = 0.020 + vBlur * 0.026;
+  float soft = aa + vBlur * 0.11;
 
-  if (mask < 0.01) discard;
+  float mask = 1.0 - smoothstep(width - soft, width + soft, dist);
+  if (mask < 0.004) discard;
 
   gl_FragColor = vec4(vColor, mask * uOpacity * vFade);
 }
