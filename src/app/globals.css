@@ -1,0 +1,80 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #000000;
+  --color-paper: #ffffff;
+  --color-muted: #9b9b9f;
+  --color-accent: #7c5cff;
+  --color-accent-soft: #a78bfa;
+  --color-amber: #f6b93b;
+
+  --font-sans: var(--font-grotesk), ui-sans-serif, system-ui, sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html {
+  background: #000;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  background: #000;
+  color: #fff;
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+}
+
+/* Lenis owns the scroll position; let it. */
+html.lenis,
+html.lenis body {
+  height: auto;
+}
+.lenis.lenis-smooth {
+  scroll-behavior: auto !important;
+}
+
+/* Fine film grain over the whole page, matching the reference's texture. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: -50%;
+  z-index: 40;
+  pointer-events: none;
+  opacity: 0.035;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/></filter><rect width='160' height='160' filter='url(%23n)'/></svg>");
+}
+
+@layer utilities {
+  .display {
+    font-weight: 400;
+    letter-spacing: -0.035em;
+    line-height: 0.92;
+  }
+  .measure {
+    max-width: 34ch;
+  }
+  /* Line-by-line reveal: each line sits in its own overflow-hidden box. */
+  .line-mask {
+    display: block;
+    overflow: hidden;
+    /* Let descenders through without letting the reveal show early. */
+    padding-bottom: 0.18em;
+    margin-bottom: -0.18em;
+  }
+  .line-mask > span {
+    display: block;
+    will-change: transform;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
