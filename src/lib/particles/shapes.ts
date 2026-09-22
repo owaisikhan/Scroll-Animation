@@ -1,14 +1,14 @@
 /**
  * Shape sources for the particle cloud.
  *
- * Each form is a hollow 3D shell, not a filled silhouette: points are sampled
- * on the surfaces of a few parametric primitives, so the far side of the form
+ * The brain is the reference site's own point cloud, baked by
+ * scripts/bake-brain.mjs into public/particles/brain.bin together with each
+ * particle's scale and colour. The other forms are hollow 3D shells sampled on
+ * the surfaces of a few parametric primitives, so the far side of the form
  * shows through the near side and the rim reads dense at grazing angles.
- * Shapes are assembled from ellipsoids, cones and capsules and then displaced
- * by value noise, which is what gives the brain its folds.
  */
 
-export type ShapeName = "brain" | "bulb" | "globe";
+export type ShapeName = "bulb" | "globe";
 
 export interface ShapeCloud {
   positions: Float32Array;
@@ -93,43 +93,7 @@ function discSurface(rand: Rand, n: number, c: Vec3, y: number, rInner: number, 
   }
 }
 
-/* ---------- the three forms ---------- */
-
-function buildBrain(rand: Rand, count: number, emit: Emit) {
-  // Two cerebral lobes, split by a longitudinal fissure, plus cerebellum and
-  // stem. Gyri come from ridged noise displacement along the surface normal.
-  const lobe = Math.floor(count * 0.40);
-  const cere = Math.floor(count * 0.09);
-  const stem = Math.floor(count * 0.05);
-
-  const foldy = (x: number, y: number, z: number, amp: number): Vec3 => {
-    const n1 = noise3(x * 3.1, y * 3.1, z * 3.1);
-    const n2 = noise3(x * 7.3 + 11, y * 7.3, z * 7.3);
-    // Ridged noise creates creases rather than lumps.
-    const ridge = 1 - Math.abs(n1 * 2 - 1);
-    const d = (ridge * 0.7 + n2 * 0.3 - 0.45) * amp;
-    const len = Math.hypot(x, y, z) || 1;
-    return [x + (x / len) * d, y + (y / len) * d, z + (z / len) * d];
-  };
-
-  for (const side of [-1, 1]) {
-    ellipsoidSurface(rand, lobe, [0, 0, 0], [1.02, 0.78, 0.86], (x, y, z) => {
-      // Push each lobe off the midline and squash the inner face flat.
-      let zz = z;
-      if (Math.sign(zz) !== side) zz = -zz;
-      zz = side * (Math.abs(zz) * 0.62 + 0.1);
-      const [fx, fy, fz] = foldy(x, y, zz, 0.12);
-      emit(fx, fy - 0.02, fz);
-    });
-  }
-
-  ellipsoidSurface(rand, cere, [0.54, -0.52, 0], [0.34, 0.24, 0.30], (x, y, z) => {
-    const [fx, fy, fz] = foldy(x * 1.4, y * 1.4, z * 1.4, 0.09);
-    emit(fx * 0.72 + 0.54 * 0.28, fy * 0.72 - 0.52 * 0.28, fz * 0.72);
-  });
-
-  frustumSurface(rand, stem, [0.30, 0, 0], -1.32, -0.42, 0.085, 0.17, emit);
-}
+/* ---------- the procedural forms ---------- */
 
 function buildBulb(rand: Rand, count: number, emit: Emit) {
   const glass = Math.floor(count * 0.60);
@@ -169,16 +133,46 @@ function buildGlobe(rand: Rand, count: number, emit: Emit) {
   });
 }
 
+/* ---------- the brain, baked from the reference ---------- */
+
+export const BRAIN_URL = "/particles/brain.bin";
+
+/** Particles in the baked brain; the reference renders exactly this many. */
+export const BRAIN_COUNT = 10000;
+
+export interface BrainData {
+  /** Positions normalised to -1..1 in the reference's own frame. */
+  positions: Float32Array;
+  /** Per-particle scale, 0..1. */
+  scales: Float32Array;
+  /** Per-particle linear RGB, 0..1. */
+  colors: Float32Array;
+}
+
+export async function loadBrain(signal?: AbortSignal): Promise<BrainData> {
+  const res = await fetch(BRAIN_URL, { signal });
+  if (!res.ok) throw new Error(`brain.bin: HTTP ${res.status}`);
+  const buf = await res.arrayBuffer();
+  const n = BRAIN_COUNT;
+  const positions = new Float32Array(buf, 0, n * 3);
+  const rawScales = new Uint8Array(buf, n * 12, n);
+  const rawColors = new Uint8Array(buf, n * 13, n * 3);
+  const scales = new Float32Array(n);
+  const colors = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) scales[i] = rawScales[i] / 255;
+  for (let i = 0; i < n * 3; i++) colors[i] = rawColors[i] / 255;
+  return { positions: new Float32Array(positions), scales, colors };
+}
+
 /* ---------- public API ---------- */
 
 const BUILDERS: Record<ShapeName, (r: Rand, n: number, e: Emit) => void> = {
-  brain: buildBrain,
   bulb: buildBulb,
   globe: buildGlobe,
 };
 
 /** World-space size of each form, so they read at comparable scale. */
-const SCALE: Record<ShapeName, number> = { brain: 1.58, bulb: 1.54, globe: 1.42 };
+const SCALE: Record<ShapeName, number> = { bulb: 1.54, globe: 1.42 };
 
 export function buildShape(name: ShapeName, count: number, seed = 1): ShapeCloud {
   const rand = mulberry32(seed);
