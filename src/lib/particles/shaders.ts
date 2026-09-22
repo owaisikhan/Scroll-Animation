@@ -1,38 +1,30 @@
 /**
- * Instanced pyramid shaders, ported from the reference's particle material.
+ * Shaders ported from the reference's particle scene.
  *
- * Every instance is a small tetrahedron-frame mesh. Its centre morphs between
- * the loaded forms; its orientation tumbles with simplex noise sampled at its
- * position plus time; its size and colour come from the baked brain data.
- *
- * Hover and depth values are worked out in the reference's own world units
- * (uUnit converts them), so the constants below match its shader verbatim.
+ * cones — the main cloud: each instance is a small tetrahedron-frame mesh
+ *   centred on its simulated position, tumbling on simplex noise plus time,
+ *   with per-form scale and colour blended by the scroll progress.
+ * frontCones — 250 large pyramids drifting in front of everything.
+ * grain — the reference's film-grain layer, which also opens the scene with
+ *   a circular reveal once the loader leaves.
  */
-export const vertexShader = /* glsl */ `
-precision highp float;
 
-attribute vec3  aFrom;
-attribute vec3  aTo;
-attribute float aSeed;
-attribute float aScale;
-attribute vec3  aColor;
-attribute vec2  aRandom;     // x: jitter speed, y: jitter reach
-
-uniform float uMorph;
-uniform float uSpread;
-uniform float uTime;
-uniform float uUnit;         // reference world units -> local units
-uniform float uSize;         // pyramid scale multiplier
-uniform vec2  uPointer;      // cursor, in NDC
-uniform vec2  uNdcToLocal;   // NDC -> local units on the cloud's plane
-uniform float uPointerOn;
-uniform vec2  uDelta;        // eased cursor velocity
-uniform float uBreath;
-
-varying vec3  vColor;
-varying float vAlpha;
+const rotation = /* glsl */ `
+mat3 rotationMatrix(vec3 axis, float angle) {
+  axis = normalize(axis);
+  float s = sin(angle);
+  float c = cos(angle);
+  float oc = 1.0 - c;
+  return mat3(
+    oc * axis.x * axis.x + c,          oc * axis.x * axis.y - axis.z * s, oc * axis.z * axis.x + axis.y * s,
+    oc * axis.x * axis.y + axis.z * s, oc * axis.y * axis.y + c,          oc * axis.y * axis.z - axis.x * s,
+    oc * axis.z * axis.x - axis.y * s, oc * axis.y * axis.z + axis.x * s, oc * axis.z * axis.z + c
+  );
+}
+`;
 
 // Ashima Arts / stegu simplex noise (MIT), as used by the reference.
+const simplex = /* glsl */ `
 vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
 vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
 vec4 permute(vec4 x) { return mod289(((x * 34.0) + 10.0) * x); }
@@ -80,84 +72,186 @@ float snoise(vec3 v) {
   m = m * m;
   return 105.0 * dot(m * m, vec4(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
 }
+`;
 
-mat3 rotationMatrix(vec3 axis, float angle) {
-  axis = normalize(axis);
-  float s = sin(angle);
-  float c = cos(angle);
-  float oc = 1.0 - c;
-  return mat3(
-    oc * axis.x * axis.x + c,          oc * axis.x * axis.y - axis.z * s, oc * axis.z * axis.x + axis.y * s,
-    oc * axis.x * axis.y + axis.z * s, oc * axis.y * axis.y + c,          oc * axis.y * axis.z - axis.x * s,
-    oc * axis.z * axis.x - axis.y * s, oc * axis.y * axis.z + axis.x * s, oc * axis.z * axis.z + c
-  );
-}
+export const conesVertex = /* glsl */ `
+precision highp float;
 
-vec3 hash3(vec3 p) {
-  p = vec3(dot(p, vec3(127.1, 311.7, 74.7)),
-           dot(p, vec3(269.5, 183.3, 246.1)),
-           dot(p, vec3(113.5, 271.9, 124.6)));
-  return fract(sin(p) * 43758.5453123) * 2.0 - 1.0;
+attribute vec3 aPos;       // simulated centre
+attribute vec4 aScales;    // per-form scale
+attribute vec3 aColor0;    // per-form colour
+attribute vec3 aColor1;
+attribute vec3 aColor2;
+attribute vec3 aColor3;
+attribute vec2 aRandom;    // x: jitter speed, y: jitter reach
+
+uniform float uTime;
+uniform float uProgress;
+uniform float uExplode;
+uniform float uScale;
+uniform vec3  uRotation;
+uniform vec2  uOffset;
+uniform vec2  uPointer;    // cursor, NDC
+uniform vec2  uNdcToWorld; // NDC -> world units on the z = 0 plane
+uniform float uPointerOn;
+uniform vec2  uDelta;      // eased cursor velocity
+
+varying vec3  vColor;
+varying float vAlpha;
+
+${rotation}
+${simplex}
+
+vec4 toView(mat3 r, vec3 p) {
+  vec4 mv = modelViewMatrix * vec4(r * p, 1.0);
+  mv.xy += uOffset;
+  return mv;
 }
 
 void main() {
-  // Per-particle stagger so the cloud flows between forms.
-  float stagger = 0.42;
-  float local = clamp((uMorph - aSeed * stagger) / (1.0 - stagger), 0.0, 1.0);
-  float eased = local * local * (3.0 - 2.0 * local);
+  mat3 r = rotationMatrix(vec3(1.0, 0.0, 0.0), uRotation.x)
+         * rotationMatrix(vec3(0.0, 1.0, 0.0), uRotation.y)
+         * rotationMatrix(vec3(0.0, 0.0, 1.0), uRotation.z);
 
-  vec3 pos = mix(aFrom, aTo, eased);
+  vec3 pos = aPos;
+  float calm = abs(uExplode - 1.0);
 
-  float arc = sin(eased * 3.14159265);
-  vec3 drift = hash3(aFrom * 1.7 + aSeed * 13.0);
-  pos += drift * arc * 0.9;
-  // At rest the form holds still (as on the reference); it only breathes
-  // while the script has it coming apart.
-  pos += hash3(aFrom * 3.1 + 7.0) * sin(uTime * 0.55 + aSeed * 6.2831) * 0.06 * max(0.0, uBreath - 1.0);
-
-  pos += drift * uSpread * 2.4;
-  pos *= 1.0 + uSpread * 0.55;
-
-  // Hover: within ~1.25 units of the cursor each pyramid orbits on its own
-  // slow sin/cos path, pushed further by fast cursor movement, and swells.
-  // Distance is measured on screen, so the near shell reacts under the
-  // cursor rather than offset by perspective.
-  vec4 clip = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
-  vec2 offset = (clip.xy / clip.w - uPointer) * uNdcToLocal;
-  float calm = 1.0 - clamp(uSpread, 0.0, 1.0);
+  // Hover: near the cursor each pyramid orbits on its own slow sin/cos
+  // path (pushed further by a fast cursor) and swells. Measured on screen
+  // so the reaction sits under the cursor whatever the depth.
+  vec4 clip = projectionMatrix * toView(r, pos);
+  vec2 offset = (clip.xy / clip.w - uPointer) * uNdcToWorld;
   float reach = 1.25 + abs(max(uDelta.x, uDelta.y));
-  float hover = smoothstep(reach, 0.0, length(offset) / uUnit) * uPointerOn * calm;
-  pos.x += hover * sin(uTime * aRandom.x) * (aRandom.y * 0.35 + uDelta.x) * uUnit;
-  pos.y += hover * cos(uTime * aRandom.x) * (aRandom.y * 0.35 + uDelta.y) * uUnit;
+  float hover = smoothstep(reach, 0.0, length(offset)) * uPointerOn;
+  pos.x += hover * sin(uTime * aRandom.x) * (aRandom.y * 0.35 + uDelta.x) * calm;
+  pos.y += hover * cos(uTime * aRandom.x) * (aRandom.y * 0.35 + uDelta.y) * calm;
 
-  // Tumble: noise over the form gives neighbours related orientations.
-  float n = snoise(pos / uUnit * 0.619);
-  mat3 rot = rotationMatrix(vec3(0.0, 1.0, 1.0), mod(n + uTime, 6.2832));
+  float n = snoise(pos * 0.619);
+  mat3 tumble = rotationMatrix(vec3(0.0, 1.0, 1.0), mod(n + uTime, 6.2832));
 
-  float scale = (aScale * uSize + hover * 0.75) * 0.1 * uUnit;
-  vec3 vertex = pos + rot * (position * scale);
+  float scale = mix(aScales.x, aScales.y, clamp(uProgress, 0.0, 1.0));
+  scale = mix(scale, aScales.z, clamp(uProgress - 1.0, 0.0, 1.0));
+  scale = mix(scale, aScales.w, clamp(uProgress - 2.0, 0.0, 1.0));
+  scale = (scale * uScale + hover * 0.75 * calm) * 0.1;
 
-  vec4 mv = modelViewMatrix * vec4(vertex, 1.0);
+  vec4 mv = toView(r, pos + tumble * (position * scale));
   gl_Position = projectionMatrix * mv;
 
-  // Hovered pyramids wash toward grey. The 1.3 lift is clamped the way the
-  // reference's 8-bit buffer clamps it, so the bloom sees the same input.
-  vColor = min(mix(aColor, vec3(0.45), hover) * 1.3, 1.0);
+  vec3 col = mix(aColor0, aColor1, clamp(uProgress, 0.0, 1.0));
+  col = mix(col, aColor2, clamp(uProgress - 1.0, 0.0, 1.0));
+  col = mix(col, aColor3, clamp(uProgress - 2.0, 0.0, 1.0));
+  col = mix(col, vec3(0.45), max(0.0, hover - uExplode) * calm);
+  // The 1.3 lift, clamped the way the reference's 8-bit buffer clamps it.
+  vColor = min(col * 1.3, 1.0);
 
-  // The back of the form fades out, so the near shell reads over the far one.
-  vAlpha = smoothstep(-4.5, 4.0, pos.z / uUnit) * (1.0 - uSpread * 0.22);
+  // Camera sits ten units back: fade the far side of the form.
+  vAlpha = smoothstep(-4.5, 4.0, mv.z + 10.0);
 }
 `;
 
-export const fragmentShader = /* glsl */ `
+export const conesFragment = /* glsl */ `
 precision highp float;
 
 varying vec3  vColor;
 varying float vAlpha;
 
-uniform float uOpacity;
-
 void main() {
-  gl_FragColor = vec4(vColor, vAlpha * uOpacity);
+  gl_FragColor = vec4(vColor, vAlpha);
 }
 `;
+
+export const frontConesVertex = /* glsl */ `
+precision highp float;
+
+attribute vec3 aBase;   // x, y in -1..1; z depth 0..9
+attribute vec4 aColor;
+attribute vec4 aAngle;
+attribute vec4 aParam;
+
+uniform float uTime;
+uniform float uScale;
+uniform vec2  uResolution; // view size at the far end of the field
+uniform vec2  uMouse;
+
+varying vec4 vColor;
+
+${rotation}
+
+void main() {
+  mat3 rot = rotationMatrix(aAngle.xyz, mod(aAngle.w * uTime * 0.15, 6.2832));
+  // Nearer pyramids spread less, so they stay framed as they grow.
+  float zFactor = mix(0.5, 0.2, aBase.z / 9.0);
+  vec3 centre = vec3(
+    aBase.x * uResolution.x * zFactor - uMouse.x * aParam.x + sin(uTime * aParam.w * 0.5) * aParam.y * 0.15,
+    aBase.y * uResolution.y * zFactor - uMouse.y * aParam.x + cos(uTime * aParam.w * 0.5) * aParam.z * 0.15,
+    aBase.z
+  );
+  vec3 vertex = centre + rot * (position * uScale);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(vertex, 1.0);
+  vColor = aColor;
+}
+`;
+
+export const frontConesFragment = /* glsl */ `
+precision highp float;
+
+varying vec4 vColor;
+
+void main() {
+  gl_FragColor = vColor;
+}
+`;
+
+/** Full-screen grain + reveal, applied before bloom like the reference layer. */
+export const GrainShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uTime: { value: 0 },
+    uShow: { value: 0 },
+    uAspect: { value: 1 },
+    uScale: { value: 1.366 },
+    uBright: { value: 0.252 },
+    uAlpha: { value: 0.149 },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform float uTime;
+    uniform float uShow;
+    uniform float uAspect;
+    uniform float uScale;
+    uniform float uBright;
+    uniform float uAlpha;
+    varying vec2 vUv;
+
+    float random(vec2 st) {
+      return fract(sin(dot(st, vec2(12.9898, 78.233))) * 43758.5453123);
+    }
+
+    void main() {
+      // The reference layer is a quad 0.4 units in front of a 50deg camera,
+      // so the screen spans +-0.1865 of its UV space vertically.
+      vec2 uv = 0.5 + (vUv - 0.5) * vec2(0.373 * uAspect, 0.373);
+
+      float s = sin(0.5), c = cos(0.5);
+      vec2 tex = uv * vec2(4096.0) * uScale - vec2(random(uv + uTime));
+      vec2 point = vec2(c * tex.x - s * tex.y, s * tex.x + c * tex.y);
+      float pat = sin(point.x) * sin(point.y) * 4.0;
+      vec3 grain = clamp(vec3(pat) * uBright, 0.0, 1.0);
+
+      vec4 scene = texture2D(tDiffuse, vUv);
+      vec3 col = mix(scene.rgb, grain, uAlpha);
+
+      // Opens from the centre as uShow runs 0 -> 1.
+      float dist = distance(vec2(0.5), uv) * 2.0;
+      col = mix(col, vec3(0.0), smoothstep(uShow - 0.1, uShow + 0.1, dist));
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+};

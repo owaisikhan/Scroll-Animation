@@ -1,99 +1,100 @@
 import * as THREE from "three";
+import gsap from "gsap";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { VignetteShader } from "three/examples/jsm/shaders/VignetteShader.js";
-import { buildShape, buildScatter, type BrainData } from "./shapes";
-import { fragmentShader, vertexShader } from "./shaders";
+import { PARTICLE_COUNT, type ShapeData } from "./shapes";
+import { Simulation } from "./simulation";
+import { frontConesX, poseDesktop, poseMobile, type Pose } from "./choreography";
+import {
+  GrainShader,
+  conesFragment,
+  conesVertex,
+  frontConesFragment,
+  frontConesVertex,
+} from "./shaders";
 import { PYRAMID_INDICES, PYRAMID_POSITIONS } from "./pyramid";
-
-function mulberry32(seed: number) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/**
- * The reference lays the brain out at 4.35 world units per normalised unit
- * (2.5 on phones, with smaller pyramids) and frames it with a 50° camera ten
- * units back. UNIT maps its world units onto ours (42° camera, 7.4 back) so
- * the brain covers the same share of the viewport at scale 1.
- */
-const REF_RADIUS = { wide: 4.35, compact: 2.5 };
-const REF_SIZE = { wide: 1.55, compact: 1.2 };
-const UNIT =
-  (7.4 * Math.tan(THREE.MathUtils.degToRad(21))) /
-  (10 * Math.tan(THREE.MathUtils.degToRad(25)));
+import { DomPyramids } from "./domPyramids";
 
 /** Per-frame easing factor at 60fps, corrected for the real frame time. */
 function ease(factor: number, dt: number) {
   return 1 - Math.pow(1 - factor, dt * 60);
 }
 
-/** The states the cloud moves through, in scroll order. */
-export const STAGES = ["brain", "scatter1", "bulb", "scatter2", "globe"] as const;
-export type Stage = (typeof STAGES)[number];
-
-export interface ParticleTargets {
-  /** 0..(STAGES.length-1) — fractional values morph between neighbours. */
-  stage: number;
-  spread: number;
-  opacity: number;
-  scale: number;
-  /** Local-space offset, in world units. */
-  x: number;
-  y: number;
-  breath: number;
+/** World-space size of the view plane `distance` in front of the camera. */
+function viewSize(camera: THREE.PerspectiveCamera, distance: number) {
+  const h = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * Math.abs(distance);
+  return { width: h * camera.aspect, height: h };
 }
 
+function pyramidGeometry() {
+  const g = new THREE.InstancedBufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(PYRAMID_POSITIONS, 3));
+  g.setIndex(new THREE.BufferAttribute(PYRAMID_INDICES, 1));
+  return g;
+}
+
+const FRONT_COLORS = [
+  [93, 57, 154],
+  [186, 136, 43],
+  [40, 116, 100],
+  [164, 148, 175],
+];
+
+/**
+ * The reference's particle scene: the main cloud of pyramids that morphs
+ * brain → lightbulb → sphere → logo as the page scrolls, the large drifting
+ * pyramids in front of it, and the grain/bloom/vignette post chain.
+ */
 export class ParticleSystem {
-  readonly targets: ParticleTargets = {
-    stage: 0,
-    spread: 0,
-    opacity: 1,
-    scale: 1,
-    x: 0,
-    y: 0,
-    breath: 1,
-  };
+  /** Section index + progress through it; drives the whole choreography. */
+  sectionProgress = 0;
 
   private renderer: THREE.WebGLRenderer;
   private composer: EffectComposer;
   private bloom: UnrealBloomPass;
+  private grain: ShaderPass;
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
-  private group = new THREE.Group();
-  private mesh!: THREE.Mesh;
-  private geometry = new THREE.InstancedBufferGeometry();
-  private material!: THREE.ShaderMaterial;
-  private clouds: Float32Array[] = [];
-  private aFrom!: THREE.InstancedBufferAttribute;
-  private aTo!: THREE.InstancedBufferAttribute;
-  private loadedPair: [number, number] = [-1, -1];
 
-  private count: number;
+  private cones = new THREE.Group();
+  private conesGeometry = pyramidGeometry();
+  private conesMaterial: THREE.ShaderMaterial;
+  private aPos: THREE.InstancedBufferAttribute;
+  private sim: Simulation;
+
+  /** Solid pyramids that track DOM boxes (the investor icons). */
+  readonly domPyramids = new DomPyramids();
+
+  private front = new THREE.Group();
+  private frontGeometry = pyramidGeometry();
+  private frontMaterial: THREE.ShaderMaterial;
+
+  private mobile: boolean;
+  /** Eased simulation inputs, like the reference's uniforms. */
+  private state = { show: 0, factor: 0, progress: 0, explode: 0, x: 0, y: 0 };
+  private rotation = new THREE.Vector3();
+  private baseRotationY = -0.25 * Math.PI;
+
   private pointer = new THREE.Vector2(0, 0);
   private prevPointer = new THREE.Vector2(0, 0);
   private smoothPointer = new THREE.Vector2(0, 0);
+  private frontMouse = new THREE.Vector2(0, 0);
   private delta = new THREE.Vector2(0, 0);
   private pointerActive = 0;
-  private hasPointer = false;
+
   private raf = 0;
-  private clock = new THREE.Clock();
+  private last = 0;
+  private time = 0;
   private disposed = false;
 
-  constructor(canvas: HTMLCanvasElement, brain: BrainData) {
-    const coarse =
-      typeof window !== "undefined" &&
-      window.matchMedia("(pointer: coarse)").matches;
-    // Same budget as the reference: the full brain, or 7k on touch devices.
-    this.count = coarse ? 7000 : brain.scales.length;
+  constructor(canvas: HTMLCanvasElement, data: ShapeData) {
+    // The reference runs a lighter, differently choreographed cloud on phones.
+    this.mobile = window.matchMedia("(max-width: 767px)").matches;
+    const count = this.mobile ? 7000 : PARTICLE_COUNT;
 
     this.renderer = new THREE.WebGLRenderer({
       canvas,
@@ -106,16 +107,38 @@ export class ParticleSystem {
     // The baked colours are authored for direct output, so skip sRGB encoding.
     this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 
-    this.camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
-    this.camera.position.z = 7.4;
-    this.scene.add(this.group);
+    this.camera = new THREE.PerspectiveCamera(50, 1, 0.1, 30);
+    this.camera.position.set(0, 0, 10);
 
-    const compact = window.matchMedia("(max-width: 860px)").matches;
-    this.buildGeometry(brain, compact ? "compact" : "wide");
+    const initial = this.pose();
+    this.state.factor = initial.factor;
+    this.state.x = initial.x;
+    this.state.y = initial.y;
 
-    // Post chain from the reference: soft bloom, then a vignette.
+    this.sim = new Simulation(data, count);
+    this.aPos = new THREE.InstancedBufferAttribute(this.sim.position, 3);
+    this.aPos.setUsage(THREE.DynamicDrawUsage);
+    this.conesMaterial = this.buildCones(data, count);
+    this.frontMaterial = this.buildFront();
+
+    this.cones.position.set(0, -1.19, 0);
+    this.cones.rotation.y = this.baseRotationY;
+    this.front.position.set(0, 0, 0.1);
+    this.scene.add(this.cones, this.front);
+
+    const dpr = window.devicePixelRatio || 1;
     this.composer = new EffectComposer(this.renderer);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.grain = new ShaderPass(GrainShader);
+    this.grain.uniforms.uScale.value = dpr >= 2 ? 1.072 : 1.366;
+    this.grain.uniforms.uBright.value = dpr >= 2 ? 0.185 : 0.252;
+    this.grain.uniforms.uAlpha.value = dpr >= 2 ? 0.138 : 0.149;
+    this.composer.addPass(this.grain);
+    // Drawn over the grain, like the reference's second (DOM-synced) scene.
+    const domPass = new RenderPass(this.domPyramids.scene, this.domPyramids.camera);
+    domPass.clear = false;
+    domPass.clearDepth = true;
+    this.composer.addPass(domPass);
     this.bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.1, 1, 0.159);
     this.composer.addPass(this.bloom);
     const vignette = new ShaderPass(VignetteShader);
@@ -127,87 +150,104 @@ export class ParticleSystem {
     this.resize();
   }
 
-  private buildGeometry(brain: BrainData, layout: "wide" | "compact") {
-    const n = this.count;
-    const rand = mulberry32(20260919);
+  private buildCones(data: ShapeData, n: number) {
+    const g = this.conesGeometry;
+    g.instanceCount = n;
 
-    const brainCloud = new Float32Array(n * 3);
-    const k = REF_RADIUS[layout] * UNIT;
-    for (let i = 0; i < n * 3; i++) brainCloud[i] = brain.positions[i] * k;
-
-    this.clouds = [
-      brainCloud,
-      buildScatter(n, 23),
-      buildShape("bulb", n, 37).positions,
-      buildScatter(n, 41, 3.0),
-      buildShape("globe", n, 59).positions,
-    ];
-
-    const seeds = new Float32Array(n);
+    const scales = new Float32Array(n * 4);
     const randoms = new Float32Array(n * 2);
     for (let i = 0; i < n; i++) {
-      seeds[i] = rand();
-      randoms[i * 2] = 0.8 * rand() + 0.2;
-      randoms[i * 2 + 1] = 0.5 * rand() + 0.5;
+      for (let k = 0; k < 4; k++) scales[i * 4 + k] = data.scales[k][i];
+      randoms[i * 2] = 0.8 * Math.random() + 0.2;
+      randoms[i * 2 + 1] = this.mobile ? 0.5 * Math.random() : 0.5 * Math.random() + 0.5;
     }
+    g.setAttribute("aPos", this.aPos);
+    g.setAttribute("aScales", new THREE.InstancedBufferAttribute(scales, 4));
+    for (let k = 0; k < 4; k++) {
+      g.setAttribute(
+        `aColor${k}`,
+        new THREE.InstancedBufferAttribute(data.colors[k].slice(0, n * 3), 3),
+      );
+    }
+    g.setAttribute("aRandom", new THREE.InstancedBufferAttribute(randoms, 2));
 
-    this.geometry.setAttribute("position", new THREE.BufferAttribute(PYRAMID_POSITIONS, 3));
-    this.geometry.setIndex(new THREE.BufferAttribute(PYRAMID_INDICES, 1));
-    this.geometry.instanceCount = n;
-
-    this.aFrom = new THREE.InstancedBufferAttribute(new Float32Array(n * 3), 3);
-    this.aTo = new THREE.InstancedBufferAttribute(new Float32Array(n * 3), 3);
-    this.aFrom.setUsage(THREE.DynamicDrawUsage);
-    this.aTo.setUsage(THREE.DynamicDrawUsage);
-
-    this.geometry.setAttribute("aFrom", this.aFrom);
-    this.geometry.setAttribute("aTo", this.aTo);
-    this.geometry.setAttribute("aSeed", new THREE.InstancedBufferAttribute(seeds, 1));
-    this.geometry.setAttribute(
-      "aScale",
-      new THREE.InstancedBufferAttribute(brain.scales.slice(0, n), 1),
-    );
-    this.geometry.setAttribute(
-      "aColor",
-      new THREE.InstancedBufferAttribute(brain.colors.slice(0, n * 3), 3),
-    );
-    this.geometry.setAttribute("aRandom", new THREE.InstancedBufferAttribute(randoms, 2));
-    this.geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 12);
-
-    this.material = new THREE.ShaderMaterial({
-      vertexShader,
-      fragmentShader,
+    const material = new THREE.ShaderMaterial({
+      vertexShader: conesVertex,
+      fragmentShader: conesFragment,
       transparent: true,
       uniforms: {
-        uMorph: { value: 0 },
-        uSpread: { value: 0 },
         uTime: { value: 0 },
-        uUnit: { value: UNIT },
-        uSize: { value: REF_SIZE[layout] },
-        uPointer: { value: new THREE.Vector2(0, 0) },
-        uNdcToLocal: { value: new THREE.Vector2(1, 1) },
+        uProgress: { value: 0 },
+        uExplode: { value: 0 },
+        uScale: { value: this.mobile ? 1.2 : 1.55 },
+        uRotation: { value: new THREE.Vector3() },
+        uOffset: { value: new THREE.Vector2() },
+        uPointer: { value: new THREE.Vector2() },
+        uNdcToWorld: { value: new THREE.Vector2(1, 1) },
         uPointerOn: { value: 0 },
-        uDelta: { value: new THREE.Vector2(0, 0) },
-        uBreath: { value: 1 },
-        uOpacity: { value: 1 },
+        uDelta: { value: new THREE.Vector2() },
       },
     });
-
-    this.mesh = new THREE.Mesh(this.geometry, this.material);
-    this.mesh.frustumCulled = false;
-    this.group.add(this.mesh);
-
-    this.setPair(0, 1);
+    const mesh = new THREE.Mesh(g, material);
+    mesh.frustumCulled = false;
+    this.cones.add(mesh);
+    return material;
   }
 
-  /** Swap which two clouds the shader is interpolating between. */
-  private setPair(from: number, to: number) {
-    if (this.loadedPair[0] === from && this.loadedPair[1] === to) return;
-    (this.aFrom.array as Float32Array).set(this.clouds[from]);
-    (this.aTo.array as Float32Array).set(this.clouds[to]);
-    this.aFrom.needsUpdate = true;
-    this.aTo.needsUpdate = true;
-    this.loadedPair = [from, to];
+  private buildFront() {
+    const n = 250;
+    const g = this.frontGeometry;
+    g.instanceCount = n;
+    const base = new Float32Array(n * 3);
+    const color = new Float32Array(n * 4);
+    const angle = new Float32Array(n * 4);
+    const param = new Float32Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      base.set([2 * Math.random() - 1, 2 * Math.random() - 1, 9 * Math.random()], i * 3);
+      const c = FRONT_COLORS[i % 4];
+      color.set([c[0] / 255, c[1] / 255, c[2] / 255, Math.random()], i * 4);
+      angle.set(
+        [
+          2 * Math.random() - 1,
+          2 * Math.random() - 1,
+          2 * Math.random() - 1,
+          2 * Math.random() - Math.PI,
+        ],
+        i * 4,
+      );
+      param.set([Math.random(), Math.random(), Math.random(), Math.random()], i * 4);
+    }
+    g.setAttribute("aBase", new THREE.InstancedBufferAttribute(base, 3));
+    g.setAttribute("aColor", new THREE.InstancedBufferAttribute(color, 4));
+    g.setAttribute("aAngle", new THREE.InstancedBufferAttribute(angle, 4));
+    g.setAttribute("aParam", new THREE.InstancedBufferAttribute(param, 4));
+
+    const material = new THREE.ShaderMaterial({
+      vertexShader: frontConesVertex,
+      fragmentShader: frontConesFragment,
+      transparent: true,
+      uniforms: {
+        uTime: { value: 0 },
+        uScale: { value: this.mobile ? 0.05 : 0.075 },
+        uResolution: { value: new THREE.Vector2(1, 1) },
+        uMouse: { value: new THREE.Vector2() },
+      },
+    });
+    const mesh = new THREE.Mesh(g, material);
+    mesh.frustumCulled = false;
+    this.front.add(mesh);
+    return material;
+  }
+
+  private pose(): Pose {
+    return this.mobile ? poseMobile(this.sectionProgress) : poseDesktop(this.sectionProgress);
+  }
+
+  /** The loader has left: fly the cloud in and open the reveal. */
+  enter() {
+    gsap.to(this.state, { show: 1, duration: 3, ease: "none" });
+    gsap.to(this, { baseRotationY: 0, duration: 3, ease: "power2.out" });
+    gsap.to(this.grain.uniforms.uShow, { value: 1, duration: 2, ease: "power2.inOut" });
   }
 
   setPointer(nx: number, ny: number, active: boolean) {
@@ -216,16 +256,12 @@ export class ParticleSystem {
       this.delta.set(0, 0);
       return;
     }
-    if (!this.hasPointer) {
-      this.prevPointer.set(nx, ny);
-      this.smoothPointer.set(nx, ny);
-      this.hasPointer = true;
-    }
     // Cursor speed, as the reference measures it: a hard flick pushes the
     // hovered pyramids further and widens the area they react in.
+    const lim = this.mobile ? 0.1 : 2;
     this.delta.set(
-      THREE.MathUtils.clamp(50 * (nx - this.prevPointer.x), -2, 2),
-      THREE.MathUtils.clamp(50 * (ny - this.prevPointer.y), -2, 2),
+      THREE.MathUtils.clamp(50 * (nx - this.prevPointer.x), -lim, lim),
+      THREE.MathUtils.clamp(50 * (ny - this.prevPointer.y), -lim, lim),
     );
     this.prevPointer.set(nx, ny);
     this.pointer.set(nx, ny);
@@ -233,18 +269,25 @@ export class ParticleSystem {
   }
 
   resize = () => {
-    const canvas = this.renderer.domElement;
-    const w = canvas.clientWidth || window.innerWidth;
-    const h = canvas.clientHeight || window.innerHeight;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const dpr = this.mobile ? Math.min(window.devicePixelRatio || 1, 2) : 1;
     this.renderer.setPixelRatio(dpr);
-    this.renderer.setSize(w, h, false);
+    this.renderer.setSize(w, h);
     this.composer.setPixelRatio(dpr);
     this.composer.setSize(w, h);
     this.camera.aspect = w / h;
-    // Keep the form a constant fraction of the viewport on narrow screens.
-    this.camera.position.z = w / h < 0.9 ? 10.5 : 7.4;
     this.camera.updateProjectionMatrix();
+
+    const plane = viewSize(this.camera, 10);
+    (this.conesMaterial.uniforms.uNdcToWorld.value as THREE.Vector2).set(
+      plane.width / 2,
+      plane.height / 2,
+    );
+    const far = viewSize(this.camera, 9.9);
+    (this.frontMaterial.uniforms.uResolution.value as THREE.Vector2).set(far.width, far.height);
+    this.grain.uniforms.uAspect.value = w / h;
+    this.domPyramids.resize(w, h);
   };
 
   start() {
@@ -257,58 +300,72 @@ export class ParticleSystem {
   }
 
   private update() {
-    const dt = Math.min(this.clock.getDelta(), 0.05);
-    const u = this.material.uniforms;
-    const t = this.targets;
+    const now = performance.now();
+    const dt = this.last ? Math.min((now - this.last) / 1000, 0.1) : 1 / 60;
+    this.last = now;
+    this.time += dt;
+    const u = this.conesMaterial.uniforms;
+    const s = this.state;
+    const k = ease(0.1, dt);
 
-    u.uTime.value += dt;
+    // Everything eases toward the pose for the current scroll position.
+    const pose = this.pose();
+    const x = this.mobile ? pose.x + 0.052 * u.uPointer.value.x : pose.x;
+    s.x += (x - s.x) * k;
+    s.y += (pose.y - s.y) * k;
+    s.explode += (pose.explode - s.explode) * k;
+    s.progress += (pose.progress - s.progress) * k;
+    if (!this.mobile) s.factor += (pose.factor - s.factor) * k;
+    const kr = ease(0.075, dt);
+    this.rotation.x += (0 - this.rotation.x) * kr;
+    this.rotation.y += (pose.rotY - this.rotation.y) * kr;
+    this.rotation.z += (pose.rotZ - this.rotation.z) * kr;
 
-    // Resolve the fractional stage into a shader-friendly (from, to, morph).
-    const maxStage = this.clouds.length - 1;
-    const s = Math.max(0, Math.min(maxStage - 0.0001, t.stage));
-    const from = Math.floor(s);
-    this.setPair(from, Math.min(from + 1, maxStage));
-    u.uMorph.value = s - from;
+    this.sim.update(dt, s);
+    this.aPos.needsUpdate = true;
 
-    u.uSpread.value += (t.spread - u.uSpread.value) * Math.min(1, dt * 6);
-    u.uOpacity.value += (t.opacity - u.uOpacity.value) * Math.min(1, dt * 6);
-    u.uBreath.value = t.breath;
+    // Pointer and its velocity trail behind the real cursor.
+    this.delta.multiplyScalar(1 - k);
+    this.smoothPointer.lerp(this.pointer, kr);
+    (u.uDelta.value as THREE.Vector2).lerp(this.delta, kr);
+    u.uPointerOn.value += (this.pointerActive - u.uPointerOn.value) * kr;
 
-    // Cursor and its velocity trail behind the real pointer, as on the
-    // reference, so the hover field glides rather than snaps.
-    const follow = ease(0.075, dt);
-    this.smoothPointer.lerp(this.pointer, follow);
-    this.delta.multiplyScalar(1 - ease(0.1, dt));
-    (u.uDelta.value as THREE.Vector2).lerp(this.delta, follow);
-    u.uPointerOn.value += (this.pointerActive - u.uPointerOn.value) * follow;
-
-    // The camera leans a few degrees toward the cursor; the form itself
-    // stays put.
-    const lean = ease(0.1, dt);
-    this.camera.rotation.y += (-0.075 * this.smoothPointer.x - this.camera.rotation.y) * lean;
-    this.camera.rotation.x += (0.05 * this.smoothPointer.y - this.camera.rotation.x) * lean;
-
-    this.group.position.x += (t.x - this.group.position.x) * Math.min(1, dt * 5);
-    this.group.position.y += (t.y - this.group.position.y) * Math.min(1, dt * 5);
-    const sc = this.group.scale.x + (t.scale - this.group.scale.x) * Math.min(1, dt * 5);
-    this.group.scale.setScalar(sc);
-
-    // The hover test runs in screen space; this converts an NDC offset into
-    // local units on the cloud's plane, whatever the group's scale.
+    u.uTime.value = this.time;
+    u.uProgress.value = s.progress;
+    u.uExplode.value = s.explode;
+    (u.uRotation.value as THREE.Vector3).copy(this.rotation);
+    (u.uOffset.value as THREE.Vector2).set(s.x, s.y);
     (u.uPointer.value as THREE.Vector2).copy(this.smoothPointer);
-    const halfH =
-      Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) *
-      (this.camera.position.z - this.group.position.z);
-    (u.uNdcToLocal.value as THREE.Vector2).set(halfH * this.camera.aspect / sc, halfH / sc);
+    this.cones.rotation.y = this.baseRotationY;
 
+    // The camera leans a few degrees toward the cursor.
+    const lean = ease(0.1, dt);
+    this.camera.rotation.y += (-0.075 * this.pointer.x - this.camera.rotation.y) * lean;
+    this.camera.rotation.x += (0.05 * this.pointer.y - this.camera.rotation.x) * lean;
+
+    const f = this.frontMaterial.uniforms;
+    f.uTime.value = this.time;
+    this.frontMouse.x += (0.25 * this.pointer.x - this.frontMouse.x) * k;
+    this.frontMouse.y += (0.25 * this.pointer.y - this.frontMouse.y) * k;
+    (f.uMouse.value as THREE.Vector2).copy(this.frontMouse);
+    if (!this.mobile) {
+      this.front.position.x += (frontConesX(this.sectionProgress) - this.front.position.x) * k;
+    }
+
+    this.grain.uniforms.uTime.value = this.time;
+    this.domPyramids.update(this.sectionProgress);
     this.composer.render(dt);
   }
 
   dispose() {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
-    this.geometry.dispose();
-    this.material.dispose();
+    gsap.killTweensOf([this.state, this, this.grain.uniforms.uShow]);
+    this.conesGeometry.dispose();
+    this.conesMaterial.dispose();
+    this.frontGeometry.dispose();
+    this.frontMaterial.dispose();
+    this.domPyramids.dispose();
     this.bloom.dispose();
     this.composer.dispose();
     this.renderer.dispose();
